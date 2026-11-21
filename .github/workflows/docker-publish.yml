@@ -104,7 +104,7 @@ jobs:
       release_assets: ${{ steps.resolve.outputs.release_assets }}
       release_latest: ${{ steps.resolve.outputs.release_latest }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve ${{ github.ref_name }}
         id: resolve
@@ -388,7 +388,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.select.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # cosign (keyless) needs the tag history to resolve the commit an
           # image was built from.
@@ -534,7 +534,7 @@ jobs:
     steps:
       - name: Checkout
         if: needs.select.outputs.release_assets == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
