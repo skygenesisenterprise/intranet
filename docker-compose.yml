@@ -1,0 +1,319 @@
+# Astron Collection — root Docker Compose stack.
+#
+# This is the single entry point for running Astron Collection from the repository root.
+# It builds the root `Dockerfile` and exposes the dashboard in the browser.
+#
+# Exactly four services:
+#
+#   GROUP 1 — DATABASE   postgres   PostgreSQL, persistent storage of the platform
+#   GROUP 2 — CACHE      redis      Redis, cache, BullMQ queues and coordination
+#   GROUP 3 — FRONTEND   client     Next.js dashboard (UI only: no PostgreSQL, no Redis)
+#   GROUP 4 — BACKEND    api        Backend: tRPC/OpenAPI, auth, WebSockets, workers
+#
+# There is no per-mode duplicate (`api-dev`, `client-dev`, …) and no sidecar: the
+# mode is an environment of these four services, set by the `prod` or `dev` profile.
+# Nothing here needs Traefik, Docker Swarm or the host Docker socket.
+#
+# ---------------------------------------------------------------------------
+# Profiles and environments
+# ---------------------------------------------------------------------------
+#   prod   docker compose --profile prod up -d --build    (default, COMPOSE_PROFILES)
+#   dev    ASTRON_COLLECTION_MODE=development ASTRON_COLLECTION_BUILD_TARGET=dev \
+#          NODE_ENV=development docker compose --profile dev up --build --watch
+#
+# `make docker-up [self|cloud|console]` and `make docker-dev [self|cloud|console]` set that whole
+# environment for you — they are the supported entry points, because a Compose file
+# cannot switch a service's build target from a profile.
+#
+# Each service belongs to both profiles and reads its mode from the environment:
+#
+#   ASTRON_COLLECTION_MODE          production | development (entrypoint behaviour)
+#   ASTRON_COLLECTION_BUILD_TARGET  api | client (prod) or dev (hot reload)
+#   NODE_ENV                        production | development
+#
+# `ASTRON_COLLECTION_BUILD_TARGET` therefore has a different default per service:
+# unset means "build this service's production target", `dev` means "build the
+# development stage", which ships the sources and dependencies the dev servers need.
+#
+# In development the sources are synchronised into the running container
+# (`develop.watch`, no bind mounts), so the image keeps its node_modules and a
+# plain `docker compose up` never accidentally mounts host files over a build.
+#
+# Both modes publish the same two ports, so they are mutually exclusive: stop one
+# before starting the other with `make docker-down`.
+#
+# ---------------------------------------------------------------------------
+# How the client talks to the API
+# ---------------------------------------------------------------------------
+# The browser calls the client origin. Next.js rewrites `/api/*` to `API_INTERNAL_URL`
+# (the `api` service on the internal network), so session cookies stay first-party and
+# the client never needs database or Redis credentials. WebSockets cannot be proxied by
+# a rewrite: they connect straight to the published API port using
+# NEXT_PUBLIC_API_URL (baked into the browser bundle at build time).
+#
+# Only these two ports are published. PostgreSQL and Redis are reachable exclusively on
+# the `astron-collection-internal` network.
+
+name: astron-collection
+
+# Shared backend configuration: the `api` service owns the credentials and the
+# migrations, in both modes.
+x-api-environment: &api-environment
+  NODE_ENV: ${NODE_ENV:-production}
+  TZ: ${TZ:-UTC}
+  # --- PostgreSQL ----------------------------------------------------------
+  # `postgres` is the internal service name — never localhost from inside a container.
+  DATABASE_URL: postgres://${POSTGRES_USER:-astron-collection}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}@postgres:5432/${POSTGRES_DB:-astron-collection}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  # --- Redis ---------------------------------------------------------------
+  REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}@redis:6379
+  # --- Authentication ------------------------------------------------------
+  # The API refuses to boot with a missing, short or well-known secret, so a
+  # placeholder copied from .env.example stops the stack instead of shipping a
+  # forgeable session cookie.
+  BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET is required — see .env.example}
+  BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+  BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_TRUSTED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+  # --- Environment (self | cloud | console) --------------------------------
+  # `self` is the self-hosted platform, `cloud` is Astron Collection Cloud and
+  # `console` is Astron Collection Console (the cloud-side fleet manager). All three
+  # run the exact same images and services: the environment only changes runtime
+  # behaviour (IS_CLOUD and ASTRON_COLLECTION_PRODUCT), never the container
+  # topology. Selected by the Makefile:
+  #   make docker-up self | make docker-up cloud | make docker-up console
+  ASTRON_COLLECTION_FLAVOR: ${ASTRON_COLLECTION_FLAVOR:-selfhosted}
+  ASTRON_COLLECTION_PRODUCT: ${ASTRON_COLLECTION_PRODUCT:-self}
+  IS_CLOUD: ${IS_CLOUD:-false}
+  # Browser-facing origin of the API, used for the WebSocket connection.
+  NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+  # --- Optional integrations (empty values disable them) -------------------
+  OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID:-}
+  OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET:-}
+  OAUTH_GITHUB_CLIENT_ID: ${OAUTH_GITHUB_CLIENT_ID:-}
+  OAUTH_GITHUB_CLIENT_SECRET: ${OAUTH_GITHUB_CLIENT_SECRET:-}
+  OAUTH_DISCORD_CLIENT_ID: ${OAUTH_DISCORD_CLIENT_ID:-}
+  OAUTH_DISCORD_CLIENT_SECRET: ${OAUTH_DISCORD_CLIENT_SECRET:-}
+
+services:
+  # -------------------------------------------------------------------------
+  # GROUP 1 — DATABASE
+  #
+  # PostgreSQL 16, official image. No host port is published: only the services
+  # attached to `astron-collection-internal` can reach it.
+  # -------------------------------------------------------------------------
+  postgres:
+    profiles: ["prod", "dev"]
+    image: postgres:16-alpine
+    container_name: astron-collection-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-astron-collection}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — see .env.example}
+      POSTGRES_DB: ${POSTGRES_DB:-astron-collection}
+      # Deterministic encoding, independent from the host locale.
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---encoding=UTF8}
+    volumes:
+      - astron-collection-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - astron-collection
+
+  # -------------------------------------------------------------------------
+  # GROUP 2 — CACHE / QUEUE
+  #
+  # Redis 7, official image. Cache, BullMQ queues and coordination. Append-only
+  # persistence keeps queued jobs across a restart; the volume makes it durable.
+  # Internal only: no host port is published.
+  # -------------------------------------------------------------------------
+  redis:
+    profiles: ["prod", "dev"]
+    image: redis:7-alpine
+    container_name: astron-collection-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required — see .env.example}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}"
+    volumes:
+      - astron-collection-redis-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'redis-cli --no-auth-warning -a "$${REDIS_PASSWORD}" ping | grep -q PONG',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - astron-collection
+
+  # -------------------------------------------------------------------------
+  # GROUP 3 — FRONTEND
+  #
+  # Next.js dashboard. `next start` in production, `next dev` in development. Both
+  # are the same platform image: `platform` is the production target, `dev` ships
+  # the sources and dependencies the dev server watches. The target comes from
+  # ASTRON_COLLECTION_BUILD_TARGET, the mode from ASTRON_COLLECTION_MODE.
+  #
+  # Deliberately without DATABASE_URL or REDIS_URL — even a mistakenly reached API
+  # route cannot run backend work in this container.
+  # -------------------------------------------------------------------------
+  client:
+    profiles: ["prod", "dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${ASTRON_COLLECTION_BUILD_TARGET:-platform}
+      args:
+        # Baked into the browser bundle: origin used for the WebSocket connection.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+        ASTRON_COLLECTION_VERSION: ${ASTRON_COLLECTION_VERSION:-latest}
+    # The same image as `api`: the edition (self | cloud | console) picks the tag,
+    # the role decides what the container runs.
+    image: ${ASTRON_COLLECTION_IMAGE:-ghcr.io/skygenesisenterprise/astron-collection}:${ASTRON_COLLECTION_VERSION:-latest}
+    container_name: astron-collection-client
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      # Selects the frontend role in the shared entrypoint.
+      ASTRON_COLLECTION_ROLE: client
+      ASTRON_COLLECTION_MODE: ${ASTRON_COLLECTION_MODE:-production}
+      PORT: 3000
+      HOST: 0.0.0.0
+      TZ: ${TZ:-UTC}
+      # Server-side proxy target for `/api/*`. Internal service name, never localhost.
+      API_INTERNAL_URL: http://api:4000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      NEXT_TELEMETRY_DISABLED: "1"
+      # Inotify works through the synchronised sources on Linux. On Docker Desktop
+      # (macOS/Windows) set DEV_POLLING=true to use polling instead.
+      CHOKIDAR_USEPOLLING: ${DEV_POLLING:-false}
+      WATCHPACK_POLLING: ${DEV_POLLING:-false}
+    ports:
+      # Host port is configurable; the container always listens on 3000.
+      - "${ASTRON_COLLECTION_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # Role-aware probe baked into the image (entrypoint.sh healthcheck): the
+      # client checks `/`, the API checks `/api/health`.
+      test: ["CMD", "/usr/local/bin/entrypoint.sh", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    develop:
+      # Development only (`make docker-dev`, which runs `up --watch`): the sources
+      # are synchronised into the container instead of being bind-mounted, so the
+      # image keeps its node_modules and a plain `up` never mounts host files over a
+      # production build.
+      watch:
+        - action: sync+restart
+          path: ./apps/astron
+          target: /usr/src/app/apps/astron
+        - action: sync+restart
+          path: ./packages
+          target: /usr/src/app/packages
+        - action: rebuild
+          path: pnpm-lock.yaml
+    networks:
+      - astron-collection
+
+  # -------------------------------------------------------------------------
+  # GROUP 4 — BACKEND
+  #
+  # Node server: tRPC and OpenAPI routes, better-auth, WebSockets, BullMQ workers
+  # and cron jobs. It owns both dependency connections and closes them on SIGTERM.
+  # Same image as `client` (`ASTRON_COLLECTION_IMAGE`), role `api`: `node
+  # dist/server.mjs` in production, `tsx server/server.ts` in development, chosen
+  # by ASTRON_COLLECTION_BUILD_TARGET.
+  #
+  # It is the only service with PostgreSQL and Redis credentials, and the only one
+  # that applies migrations: once at startup (ASTRON_COLLECTION_RUN_MIGRATIONS=1,
+  # the default) so a deployment never starts against a stale schema. Scaling the
+  # API horizontally means setting that to 0 and running `make migrate` once.
+  # -------------------------------------------------------------------------
+  api:
+    profiles: ["prod", "dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ${ASTRON_COLLECTION_BUILD_TARGET:-platform}
+      args:
+        ASTRON_COLLECTION_VERSION: ${ASTRON_COLLECTION_VERSION:-latest}
+        ASTRON_COLLECTION_FLAVOR: ${ASTRON_COLLECTION_FLAVOR:-selfhosted}
+        ASTRON_COLLECTION_PRODUCT: ${ASTRON_COLLECTION_PRODUCT:-self}
+    image: ${ASTRON_COLLECTION_IMAGE:-ghcr.io/skygenesisenterprise/astron-collection}:${ASTRON_COLLECTION_VERSION:-latest}
+    container_name: astron-collection-api
+    restart: unless-stopped
+    environment:
+      <<: *api-environment
+      # Selects the backend role in the shared entrypoint.
+      ASTRON_COLLECTION_ROLE: api
+      ASTRON_COLLECTION_MODE: ${ASTRON_COLLECTION_MODE:-production}
+      # Single API instance: it owns the migrations of this deployment.
+      ASTRON_COLLECTION_RUN_MIGRATIONS: ${ASTRON_COLLECTION_RUN_MIGRATIONS:-1}
+      PORT: 4000
+      HOST: 0.0.0.0
+      NEXT_TELEMETRY_DISABLED: "1"
+      CHOKIDAR_USEPOLLING: ${DEV_POLLING:-false}
+      WATCHPACK_POLLING: ${DEV_POLLING:-false}
+    ports:
+      # Published so the browser can open the WebSocket connection (and for API clients).
+      - "${ASTRON_COLLECTION_API_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Role-aware probe baked into the image (entrypoint.sh healthcheck).
+      test: ["CMD", "/usr/local/bin/entrypoint.sh", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    develop:
+      # Development only (see the client service above).
+      watch:
+        - action: sync+restart
+          path: ./apps/astron
+          target: /usr/src/app/apps/astron
+        - action: sync+restart
+          path: ./packages
+          target: /usr/src/app/packages
+        - action: rebuild
+          path: pnpm-lock.yaml
+    networks:
+      - astron-collection
+
+volumes:
+  # Application data. Deleting these volumes destroys the database and the queued
+  # jobs; `docker compose down` alone preserves them.
+  astron-collection-postgres-data:
+    name: astron-collection-postgres-data
+  astron-collection-redis-data:
+    name: astron-collection-redis-data
+
+networks:
+  # Single internal bridge network. PostgreSQL and Redis are reachable only through
+  # it; it is not `internal: true` because the API needs outbound access (git
+  # providers, OAuth, AI providers, notifications).
+  astron-collection:
+    name: astron-collection-internal
+    driver: bridge
